@@ -1,663 +1,213 @@
-﻿#include <stdbool.h>
+﻿/* Copyright (c) Microsoft Corporation. All rights reserved.
+   Licensed under the MIT License. */
+
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "arducam_driver\ArduCAM.h"
+#include "Log_Debug.h"
+#include "delay.h"
+#include "VectorTable.h"
+
+#include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <signal.h>
-#include <stdio.h>
-
 #include <applibs/log.h>
-#include <applibs/gpio.h>
-
-// Azure IoT SDK
-#include <iothub_client_core_common.h>
-#include <iothub_device_client_ll.h>
-#include <iothub_client_options.h>
-#include <iothubtransportmqtt.h>
-#include <iothub.h>
-#include <azure_sphere_provisioning.h>
-
-
-
-// Core to core communications libraries
-#include <ctype.h>
-#include <sys/time.h>
-#include <sys/socket.h>
-#include <applibs/application.h>
-
 #include <applibs/networking.h>
-#include "epoll_timerfd_utilities.h"
+#include <curl\curl.h>
+#include <curl\easy.h>
 
-// Grove Temperature and Humidity Sensor
-#include "../MT3620_Grove_Shield/MT3620_Grove_Shield_Library/Grove.h"
-#include "../MT3620_Grove_Shield/MT3620_Grove_Shield_Library/Sensors/GroveTempHumiSHT31.h"
+#define CFG_MODE_JPEG
 
-#include "parson.h"
+//uint8_t ImageBuffer[64 * 1024];
 
-#define SEND_STATUS_PIN 9
-#define LIGHT_PIN 15
-#define RELAY_PIN 0
-#define JSON_MESSAGE_BYTES 100  // Number of bytes to allocate for the JSON telemetry message for IoT Central
-#define SCOPEID_LENGTH 20
+struct image_buffer {
+	uint8_t* p_data;
+	uint32_t size;
+};
 
-static volatile sig_atomic_t terminationRequired = false;
+const char* FileURI = "https://owenstorageaccount.blob.core.windows.net/img/test.jpg";
+const char* SASToken = "?sv=2019-10-10&st=2020-11-03T11%3A56%3A11Z&se=2021-11-04T11%3A56%3A00Z&sr=c&sp=rcwl&sig=%2BTrpLpN3c7WY2v12Le3rRQSZ7EPsfUPYTy3RPUsxCTs%3D";
 
-typedef struct {
-	int fd;
-	int pin;
-	GPIO_Value initialState;
-	bool invertPin;
-	bool twinState;
-	const char* twinProperty;
-} Peripheral;
-
-typedef struct {
-	EventData eventData;
-	struct timespec period;
-	int fd;
-	const char* name;
-} Timer;
-
-static char scopeId[SCOPEID_LENGTH]; // ScopeId for the Azure IoT Central application, set in app_manifest.json, CmdArgs
-
-static IOTHUB_DEVICE_CLIENT_LL_HANDLE iothubClientHandle = NULL;
-static const int keepalivePeriodSeconds = 20;
-static bool iothubAuthenticated = false;
-
-
-// Azure IoT poll periods
-static const int AzureIoTDefaultPollPeriodSeconds = 5;
-static const int AzureIoTMinReconnectPeriodSeconds = 60;
-static const int AzureIoTMaxReconnectPeriodSeconds = 10 * 60;
-
-static int azureIoTPollPeriodSeconds = 1;
-static int msgId = 0;
-
-static int i2cFd;
-static void* sht31;
-
-static Peripheral sending = { -1, SEND_STATUS_PIN, GPIO_Value_High, true, false, "SendStatus" };
-static Peripheral light = { -1, LIGHT_PIN, GPIO_Value_High, true, false, "LightStatus" };
-static Peripheral relay = { -1, RELAY_PIN, GPIO_Value_Low, false, false, "RelayStatus" };
-
-static void AzureTimerEventHandler(EventData*);
-static void AzureDoWorkTimerEventHandler(EventData*);
-static void SocketEventHandler(EventData* eventData);
-static void TimerEventHandler(EventData* eventData);
-
-static int epollFd = -1;
-static Timer iotClientDoWork = { .eventData = {.eventHandler = &AzureDoWorkTimerEventHandler }, .period = { 1, 0 }, .name = "DoWork" };
-static Timer iotClientMeasureSensor = { .eventData = {.eventHandler = &AzureTimerEventHandler }, .period = { 5, 0 }, .name = "MeasureSensor" };
-static Timer rtCoreSend = { .eventData = {.eventHandler = &TimerEventHandler }, .period = { 1, 0 }, .name = "rtCoreSend" };
-
-//static int timerFd = -1;
-static int sockFd = -1;
-static const char rtAppComponentId[] = "005180bc-402f-4cb3-a662-72937dbcde47";
-static void SendMessageToRTCore(void);
-static EventData socketEventData = { .eventHandler = &SocketEventHandler };
-
-// Forward signatures
-static void TerminationHandler(int);
-static void SendTelemetry(void);
-static void SetupAzureClient(void);
-static void SendMessageCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT, void*);
-static void TwinReportState(const char*, bool);
-static void SetDesiredState(JSON_Object*, Peripheral*);
-static const char* GetReasonString(IOTHUB_CLIENT_CONNECTION_STATUS_REASON);
-static const char* getAzureSphereProvisioningResultString(AZURE_SPHERE_PROV_RETURN_VALUE);
-static int InitPeripheralsAndHandlers(void);
-static void ClosePeripheralsAndHandlers(void);
-
-
-
-int main(int argc, char* argv[])
+static void LogCurlError(const char* message, int curlErrCode)
 {
-	Log_Debug("IoT Hub/Central Application starting.\n");
+	Log_Debug(message);
+	Log_Debug(" (curl err=%d, '%s')\n", curlErrCode, curl_easy_strerror(curlErrCode));
+}
 
-	if (argc == 2) {
-		Log_Debug("Setting Azure Scope ID %s\n", argv[1]);
-		strncpy(scopeId, argv[1], SCOPEID_LENGTH);
+static size_t read_callback(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+	struct image_buffer* p_image_buffer = (struct image_buffer*)userdata;
+
+	size_t total_available_size = size * nitems;
+	size_t copy_size = 0;
+
+	if (p_image_buffer->size > total_available_size) {
+		copy_size = total_available_size;
+		p_image_buffer->size -= total_available_size;
 	}
 	else {
-		Log_Debug("ScopeId needs to be set in the app_manifest CmdArgs\n");
-		return -1;
+		copy_size = p_image_buffer->size;
+		p_image_buffer->size = 0;
 	}
 
-	if (InitPeripheralsAndHandlers() != 0) {
-		terminationRequired = true;
+	for (size_t i = 0; i < copy_size; i++) {
+		buffer[i] = *p_image_buffer->p_data++;
 	}
 
-	// Main loop
-	while (!terminationRequired) {
-		if (WaitForEventAndCallHandler(epollFd) != 0) {
-			terminationRequired = true;
-		}
-	}
-
-	ClosePeripheralsAndHandlers();
-
-	Log_Debug("Application exiting.\n");
-
-	return 0;
+	return copy_size;
 }
 
-/// <summary>
-///     Reads telemetry and returns the data as a JSON object.
-/// </summary>
-static int ReadTelemetry(char eventBuffer[], size_t len) {
-	GroveTempHumiSHT31_Read(sht31);
-	float temperature = GroveTempHumiSHT31_GetTemperature(sht31);
-	float humidity = GroveTempHumiSHT31_GetHumidity(sht31);
-
-	static const char* EventMsgTemplate = "{ \"Temperature\": \"%3.2f\", \"Humidity\": \"%3.1f\", \"MsgId\":%d }";
-	return snprintf(eventBuffer, len, EventMsgTemplate, temperature, humidity, msgId++);
-}
-
-static void preSendTelemtry(void) {
-	GPIO_SetValue(sending.fd, GPIO_Value_Low);
-}
-
-static void postSendTelemetry(void) {
-	GPIO_SetValue(sending.fd, GPIO_Value_High);
-}
-
-static int OpenPeripheral(Peripheral *peripheral) {
-	peripheral->fd = GPIO_OpenAsOutput(peripheral->pin, GPIO_OutputMode_PushPull, peripheral->initialState);
-	if (peripheral->fd < 0) {
-		Log_Debug(
-			"Error opening GPIO: %s (%d). Check that app_manifest.json includes the GPIO used.\n",
-			strerror(errno), errno);
-		return -1;
-	}
-}
-
-static int StartTimer(Timer *timer) {
-	timer->fd = CreateTimerFdAndAddToEpoll(epollFd, &timer->period, &timer->eventData, EPOLLIN);
-	if (timer->fd < 0) {
-		return -1;
-	}
-}
-
-/// <summary>
-///     Set up SIGTERM termination handler, initialize peripherals, and set up event handlers.
-/// </summary>
-/// <returns>0 on success, or -1 on failure</returns>
-static int InitPeripheralsAndHandlers(void)
+static void UploadFileToAzureBlob(uint8_t* p_data, uint32_t size)
 {
-	struct sigaction action;
-	memset(&action, 0, sizeof(struct sigaction));
-	action.sa_handler = TerminationHandler;
-	sigaction(SIGTERM, &action, NULL);
+	static struct image_buffer userdata;
+	userdata.p_data = p_data;
+	userdata.size = size;
 
-	epollFd = CreateEpollFd();
-	if (epollFd < 0) {
-		return -1;
+	CURL* curlHandle = NULL;
+	CURLcode res = CURLE_OK;
+	struct curl_slist* list = NULL;
+
+	if ((res = curl_global_init(CURL_GLOBAL_ALL)) != CURLE_OK) {
+		LogCurlError("curl_global_init", res);
+		goto exitLabel;
 	}
 
-	OpenPeripheral(&sending);
-	OpenPeripheral(&relay);
-	OpenPeripheral(&light);
+	char* sasurl = calloc(strlen(FileURI) + strlen(SASToken) + sizeof('\0'), sizeof(char));
+	(void)strcat(strcat(sasurl, FileURI), SASToken);
 
-	// Initialize Grove Shield and Grove Temperature and Humidity Sensor
-	GroveShield_Initialize(&i2cFd, 115200);
-	sht31 = GroveTempHumiSHT31_Open(i2cFd);
-
-	StartTimer(&iotClientDoWork);
-	StartTimer(&iotClientMeasureSensor);
-	StartTimer(&rtCoreSend);
-
-
-	// Open connection to real-time capable application.
-	sockFd = Application_Socket(rtAppComponentId);
-	if (sockFd == -1) {
-		Log_Debug("ERROR: Unable to create socket: %d (%s)\n", errno, strerror(errno));
-		return -1;
+	if ((curlHandle = curl_easy_init()) == NULL) {
+		Log_Debug("curl_easy_init() failed\r\n");
+		goto cleanupLabel;
 	}
 
-	// Set timeout, to handle case where real-time capable application does not respond.
-	static const struct timeval recvTimeout = { .tv_sec = 5, .tv_usec = 0 };
-	int result = setsockopt(sockFd, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, sizeof(recvTimeout));
-	if (result == -1) {
-		Log_Debug("ERROR: Unable to set socket timeout: %d (%s)\n", errno, strerror(errno));
-		return -1;
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_URL, sasurl)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_URL", res);
+		goto cleanupLabel;
 	}
 
-	// Register handler for incoming messages from real-time capable application.
-	if (RegisterEventHandlerToEpoll(epollFd, sockFd, &socketEventData, EPOLLIN) != 0) {
-		return -1;
+	list = curl_slist_append(list, "x-ms-blob-type:BlockBlob");
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_HTTPHEADER, list)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_HTTPHEADER", res);
+		goto cleanupLabel;
 	}
 
-	return 0;
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_UPLOAD, 1)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_UPLOAD", res);
+		goto cleanupLabel;
+	}
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_INFILESIZE, size)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_INFILESIZE", res);
+		goto cleanupLabel;
+	}
+
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_READFUNCTION, read_callback)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_READFUNCTION", res);
+		goto cleanupLabel;
+	}
+
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_READDATA, &userdata)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_READFUNCTION", res);
+		goto cleanupLabel;
+	}
+
+	// Set output level to verbose.
+	if ((res = curl_easy_setopt(curlHandle, CURLOPT_VERBOSE, 1L)) != CURLE_OK) {
+		LogCurlError("curl_easy_setopt CURLOPT_VERBOSE", res);
+		goto cleanupLabel;
+	}
+
+	// Perform the opeartion
+	if ((res = curl_easy_perform(curlHandle)) != CURLE_OK) {
+		LogCurlError("curl_easy_perform", res);
+	}
+
+cleanupLabel:
+	free(sasurl);
+	// Clean up sample's cURL resources.
+	curl_easy_cleanup(curlHandle);
+	// Clean up cURL library's resources.
+	curl_global_cleanup();
+
+exitLabel:
+	return;
 }
 
-/// <summary>
-///     Close peripherals and handlers.
-/// </summary>
-static void ClosePeripheralsAndHandlers(void)
+_Noreturn void RTCoreMain(void)
 {
-	Log_Debug("Closing file descriptors\n");
-	CloseFdAndPrintError(iotClientDoWork.fd, iotClientDoWork.name);
-	CloseFdAndPrintError(iotClientMeasureSensor.fd, iotClientMeasureSensor.name);
-	CloseFdAndPrintError(rtCoreSend.fd, rtCoreSend.name);
-	CloseFdAndPrintError(sending.fd, sending.twinProperty);
-	CloseFdAndPrintError(relay.fd, relay.twinProperty);
-	CloseFdAndPrintError(epollFd, "Epoll");
-}
+	VectorTableInit();
+	//CPUFreq_Set(197600000);
 
-/// <summary>
-///     Callback invoked when a Device Twin update is received from IoT Hub.
-///     Updates local state for 'showEvents' (bool).
-/// </summary>
-/// <param name="payload">contains the Device Twin JSON document (desired and reported)</param>
-/// <param name="payloadSize">size of the Device Twin JSON document</param>
-static void TwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsigned char* payload,
-	size_t payloadSize, void* userContextCallback)
-{
-	JSON_Value* root_value = NULL;
-	JSON_Object* root_object = NULL;
+	//initialises UART
+	DebugUARTInit();
 
-	char* payLoadString = (char*)malloc(payloadSize + 1);
-	if (payLoadString == NULL) {
-		goto cleanup;
-	}
+	Log_Debug("Exmaple to capture a JPEG image from ArduCAM mini 2MP Plus\r\n");
 
-	memcpy(payLoadString, payload, payloadSize);
-	payLoadString[payloadSize] = 0; //null terminate string
-
-	root_value = json_parse_string(payLoadString);
-	if (root_value == NULL) {
-		goto cleanup;
-	}
-
-	root_object = json_value_get_object(root_value);
-	if (root_object == NULL) {
-		goto cleanup;
-	}
-
-
-	JSON_Object* desiredProperties = json_object_dotget_object(root_object, "desired");
-	if (desiredProperties == NULL) {
-		desiredProperties = root_object;
-	}
-
-	SetDesiredState(desiredProperties, &relay);
-	SetDesiredState(desiredProperties, &light);
-
-cleanup:
-	// Release the allocated memory.
-	if (root_value != NULL) {
-		json_value_free(root_value);
-	}
-	free(payLoadString);
-}
-
-static void SetDesiredState(JSON_Object* desiredProperties, Peripheral* peripheral) {
-	JSON_Object* jsonObject = json_object_dotget_object(desiredProperties, peripheral->twinProperty);
-	if (jsonObject != NULL) {
-		peripheral->twinState = (bool)json_object_get_boolean(jsonObject, "value");
-		if (peripheral->invertPin) {
-			GPIO_SetValue(peripheral->fd, (peripheral->twinState == true ? GPIO_Value_Low : GPIO_Value_High));
-		}
-		else {
-			GPIO_SetValue(peripheral->fd, (peripheral->twinState == true ? GPIO_Value_High : GPIO_Value_Low));
-		}
-		TwinReportState(peripheral->twinProperty, peripheral->twinState);
-	}
-}
-
-static int AzureDirectMethodHandler(const char* method_name, const unsigned char* payload, size_t payloadSize,
-	unsigned char** responsePayload, size_t* responsePayloadSize, void* userContextCallback) {
-
-	const char* onSuccess = "\"Successfully invoke device method\"";
-	const char* notFound = "\"No method found\"";
-
-	const char* responseMessage = onSuccess;
-	int result = 200;
-	JSON_Value* root_value = NULL;
-	JSON_Object* root_object = NULL;
-
-	// Prepare the payload for the response. This is a heap allocated null terminated string.
-	// The Azure IoT Hub SDK is responsible of freeing it.
-	*responsePayload = NULL;  // Response payload content.
-	*responsePayloadSize = 0; // Response payload content size.
-
-	char* payLoadString = (char*)malloc(payloadSize + 1);
-	if (payLoadString == NULL) {
-		responseMessage = "payload memory failed";
-		result = 500;
-		goto cleanup;
-	}
-
-	memcpy(payLoadString, payload, payloadSize);
-	payLoadString[payloadSize] = 0; //null terminate string
-
-	root_value = json_parse_string(payLoadString);
-	if (root_value == NULL) {
-		responseMessage = "Invalid JSON";
-		result = 500;
-		goto cleanup;
-	}
-
-	root_object = json_value_get_object(root_value);
-	if (root_object == NULL) {
-		responseMessage = "Invalid JSON";
-		result = 500;
-		goto cleanup;
-	}
-
-	if (strcmp(method_name, "fanspeed") == 0)
-	{
-		int speed = (int)json_object_get_number(root_object, "speed");
-		Log_Debug("Set fan speed %d", speed);
-	}
-	else
-	{
-		responseMessage = notFound;
-		result = 404;
-	}
-
-cleanup:
-
-	// Prepare the payload for the response. This is a heap allocated null terminated string.
-	// The Azure IoT Hub SDK is responsible of freeing it.
-	*responsePayloadSize = strlen(responseMessage);
-	*responsePayload = (unsigned char*)malloc(*responsePayloadSize);
-	strncpy((char*)(*responsePayload), responseMessage, *responsePayloadSize);
-
-	if (root_value != NULL) {
-		json_value_free(root_value);
-	}
-	free(payLoadString);
-
-	return result;
-}
-
-/// <summary>
-///     Callback invoked when the Device Twin reported properties are accepted by IoT Hub.
-/// </summary>
-static void ReportStatusCallback(int result, void* context)
-{
-	Log_Debug("INFO: Device Twin reported properties update result: HTTP status code %d\n", result);
-}
-
-static void TwinReportState(const char* propertyName, bool propertyValue)
-{
-	if (iothubClientHandle == NULL) {
-		Log_Debug("ERROR: client not initialized\n");
+	// init hardware and probe camera
+	arducam_ll_init();
+	arducam_reset();
+	if (arducam_test() == 0) {
+		Log_Debug("ArduCAM mini 2MP Plus is found\r\n");
 	}
 	else {
-		static char reportedPropertiesString[30] = { 0 };
-		int len = snprintf(reportedPropertiesString, 30, "{\"%s\":%s}", propertyName,
-			(propertyValue == true ? "true" : "false"));
-		if (len < 0)
-			return;
-
-		if (IoTHubDeviceClient_LL_SendReportedState(
-			iothubClientHandle, (unsigned char*)reportedPropertiesString,
-			strlen(reportedPropertiesString), ReportStatusCallback, 0) != IOTHUB_CLIENT_OK) {
-			Log_Debug("ERROR: failed to set reported state for '%s'.\n", propertyName);
-		}
-		else {
-			Log_Debug("INFO: Reported state for '%s' to value '%s'.\n", propertyName,
-				(propertyValue == true ? "true" : "false"));
-		}
-	}
-}
-
-/// <summary>
-///     Sends telemetry to IoT Hub
-/// </summary>
-static void SendTelemetry(void)
-{
-	preSendTelemtry();
-
-	static char eventBuffer[JSON_MESSAGE_BYTES] = { 0 };
-
-	int len = ReadTelemetry(eventBuffer, sizeof(eventBuffer));
-
-	if (len < 0)
-		return;
-
-	Log_Debug("Sending IoT Hub Message: %s\n", eventBuffer);
-
-	IOTHUB_MESSAGE_HANDLE messageHandle = IoTHubMessage_CreateFromString(eventBuffer);
-
-	if (messageHandle == 0) {
-		Log_Debug("WARNING: unable to create a new IoTHubMessage\n");
-		return;
+		Log_Debug("ArduCAM mini 2MP Plus is not found\r\n");
+		while (1);
+		goto END;
 	}
 
-	if (IoTHubDeviceClient_LL_SendEventAsync(iothubClientHandle, messageHandle, SendMessageCallback,
-		/*&callback_param*/ 0) != IOTHUB_CLIENT_OK) {
-		Log_Debug("WARNING: failed to hand over the message to IoTHubClient\n");
-	}
-	else {
-		Log_Debug("INFO: IoTHubClient accepted the message for delivery\n");
-	}
+	// config Camera
+	arducam_set_format(JPEG);
+	arducam_InitCAM();
+	arducam_OV2640_set_JPEG_size(OV2640_160x120);
+	delay_ms(1000);
+	arducam_clear_fifo_flag();
+	arducam_flush_fifo();
 
-	IoTHubMessage_Destroy(messageHandle);
+	// Trigger a capture and wait for data ready in DRAM
+	arducam_start_capture();
+	while (!arducam_check_fifo_done());
 
-	postSendTelemetry();
-}
-
-static void AzureDoWorkTimerEventHandler(EventData* eventData) {
-	if (iothubClientHandle != NULL) {
-		IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
-		//Log_Debug("do work");
-	}
-}
-
-/// <summary>
-/// Azure timer event:  Check connection status and send telemetry
-/// </summary>
-static void AzureTimerEventHandler(EventData* eventData)
-{
-	if (ConsumeTimerFdEvent(iotClientMeasureSensor.fd) != 0) {
-		terminationRequired = true;
-		return;
+	uint32_t img_len = arducam_read_fifo_length();
+	if (img_len > MAX_FIFO_SIZE) {
+		Log_Debug("ERROR: FIFO overflow\r\n");
+		goto END;
 	}
 
-	bool isNetworkReady = false;
-	if (Networking_IsNetworkingReady(&isNetworkReady) != -1) {
-		if (isNetworkReady && !iothubAuthenticated) {
-			SetupAzureClient();
-		}
-	}
-	else {
-		Log_Debug("Failed to get Network state\n");
-	}
+	Log_Debug("len = %d\r\n", img_len);
 
-	if (iothubAuthenticated) {
-		SendTelemetry();
-		IoTHubDeviceClient_LL_DoWork(iothubClientHandle);
-	}
-}
+	uint8_t* p_imgBuffer = malloc(img_len);
 
-static void TerminationHandler(int signalNumber)
-{
-	// Don't use Log_Debug here, as it is not guaranteed to be async-signal-safe.
-	terminationRequired = true;
-}
+	arducam_CS_LOW();
+	arducam_set_fifo_burst();
+	arducam_read_fifo_burst(p_imgBuffer, img_len);
+	arducam_CS_HIGH();
 
-/// <summary>
-///     Callback confirming message delivered to IoT Hub.
-/// </summary>
-/// <param name="result">Message delivery status</param>
-/// <param name="context">User specified context</param>
-static void SendMessageCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result, void* context)
-{
-	Log_Debug("INFO: Message received by IoT Hub. Result is: %d\n", result);
-}
+	arducam_clear_fifo_flag();
 
-/// <summary>
-///     Sets the IoT Hub authentication state for the app
-///     The SAS Token expires which will set the authentication state
-/// </summary>
-static void HubConnectionStatusCallback(IOTHUB_CLIENT_CONNECTION_STATUS result, IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason, void* userContextCallback)
-{
-	iothubAuthenticated = (result == IOTHUB_CLIENT_CONNECTION_AUTHENTICATED);
-	Log_Debug("IoT Hub Authenticated: %s\n", GetReasonString(reason));
-}
-
-/// <summary>
-///     Sets up the Azure IoT Hub connection (creates the iothubClientHandle)
-///     When the SAS Token for a device expires the connection needs to be recreated
-///     which is why this is not simply a one time call.
-/// </summary>
-static void SetupAzureClient(void)
-{
-	if (iothubClientHandle != NULL) {
-		IoTHubDeviceClient_LL_Destroy(iothubClientHandle);
+	// OV2640 pad 0x00 bytes at the end of JPG image
+	while (p_imgBuffer[img_len - 1] != 0xD9) {
+		--img_len;
 	}
 
-	AZURE_SPHERE_PROV_RETURN_VALUE provResult = IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning(scopeId, 10000, &iothubClientHandle);
-	Log_Debug("IoTHubDeviceClient_LL_CreateWithAzureSphereDeviceAuthProvisioning returned '%s'.\n", getAzureSphereProvisioningResultString(provResult));
+	uint8_t* p_file;
+	uint32_t file_size;
 
-	if (provResult.result != AZURE_SPHERE_PROV_RESULT_OK) {
+	p_file = p_imgBuffer;
+	file_size = img_len;
 
-		// If we fail to connect, reduce the polling frequency, starting at
-		// AzureIoTMinReconnectPeriodSeconds and with a backoff up to
-		// AzureIoTMaxReconnectPeriodSeconds
-		if (azureIoTPollPeriodSeconds == AzureIoTDefaultPollPeriodSeconds) {
-			azureIoTPollPeriodSeconds = AzureIoTMinReconnectPeriodSeconds;
-		}
-		else {
-			azureIoTPollPeriodSeconds *= 2;
-			if (azureIoTPollPeriodSeconds > AzureIoTMaxReconnectPeriodSeconds) {
-				azureIoTPollPeriodSeconds = AzureIoTMaxReconnectPeriodSeconds;
-			}
-		}
-
-		struct timespec azureTelemetryPeriod = { azureIoTPollPeriodSeconds, 0 };
-		SetTimerFdToPeriod(iotClientMeasureSensor.fd, &azureTelemetryPeriod);
-
-		Log_Debug("ERROR: failure to create IoTHub Handle - will retry in %i seconds.\n", azureIoTPollPeriodSeconds);
-		return;
+	bool isNetworkingReady = false;
+	while ((Networking_IsNetworkingReady(&isNetworkingReady) < 0) || !isNetworkingReady) {
+		Log_Debug("\nNot doing download because network is not up, try again\r\n");
 	}
 
-	// Successfully connected, so make sure the polling frequency is back to the default
-	azureIoTPollPeriodSeconds = AzureIoTDefaultPollPeriodSeconds;
-	struct timespec azureTelemetryPeriod = { azureIoTPollPeriodSeconds, 0 };
-	SetTimerFdToPeriod(iotClientMeasureSensor.fd, &azureTelemetryPeriod);
+	UploadFileToAzureBlob(p_file, file_size);
 
-	iothubAuthenticated = true;
+	free(p_file);
 
-	if (IoTHubDeviceClient_LL_SetOption(iothubClientHandle, OPTION_KEEP_ALIVE, &keepalivePeriodSeconds) != IOTHUB_CLIENT_OK) {
-		Log_Debug("ERROR: failure setting option \"%s\"\n", OPTION_KEEP_ALIVE);
-		return;
-	}
+	Log_Debug("App Exit\r\n");
 
-	IoTHubDeviceClient_LL_SetDeviceTwinCallback(iothubClientHandle, TwinCallback, NULL);
-	IoTHubDeviceClient_LL_SetDeviceMethodCallback(iothubClientHandle, AzureDirectMethodHandler, NULL);
-	IoTHubDeviceClient_LL_SetConnectionStatusCallback(iothubClientHandle, HubConnectionStatusCallback, NULL);
-	
-}
-
-/// <summary>
-///     Converts AZURE_SPHERE_PROV_RETURN_VALUE to a string.
-/// </summary>
-static const char* getAzureSphereProvisioningResultString(
-	AZURE_SPHERE_PROV_RETURN_VALUE provisioningResult)
-{
-	switch (provisioningResult.result) {
-	case AZURE_SPHERE_PROV_RESULT_OK:
-		return "AZURE_SPHERE_PROV_RESULT_OK";
-	case AZURE_SPHERE_PROV_RESULT_INVALID_PARAM:
-		return "AZURE_SPHERE_PROV_RESULT_INVALID_PARAM";
-	case AZURE_SPHERE_PROV_RESULT_NETWORK_NOT_READY:
-		return "AZURE_SPHERE_PROV_RESULT_NETWORK_NOT_READY";
-	case AZURE_SPHERE_PROV_RESULT_DEVICEAUTH_NOT_READY:
-		return "AZURE_SPHERE_PROV_RESULT_DEVICEAUTH_NOT_READY";
-	case AZURE_SPHERE_PROV_RESULT_PROV_DEVICE_ERROR:
-		return "AZURE_SPHERE_PROV_RESULT_PROV_DEVICE_ERROR";
-	case AZURE_SPHERE_PROV_RESULT_GENERIC_ERROR:
-		return "AZURE_SPHERE_PROV_RESULT_GENERIC_ERROR";
-	default:
-		return "UNKNOWN_RETURN_VALUE";
-	}
-}
-
-/// <summary>
-///     Converts the IoT Hub connection status reason to a string.
-/// </summary>
-static const char* GetReasonString(IOTHUB_CLIENT_CONNECTION_STATUS_REASON reason)
-{
-	static char* reasonString = "unknown reason";
-	switch (reason) {
-	case IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_EXPIRED_SAS_TOKEN";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_DEVICE_DISABLED:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_DEVICE_DISABLED";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_BAD_CREDENTIAL:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_BAD_CREDENTIAL";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_RETRY_EXPIRED:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_RETRY_EXPIRED";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_NO_NETWORK:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_NO_NETWORK";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_COMMUNICATION_ERROR:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_COMMUNICATION_ERROR";
-		break;
-	case IOTHUB_CLIENT_CONNECTION_OK:
-		reasonString = "IOTHUB_CLIENT_CONNECTION_OK";
-		break;
-	}
-	return reasonString;
-}
-
-/// <summary>
-///     Handle socket event by reading incoming data from real-time capable application.
-/// </summary>
-static void SocketEventHandler(EventData* eventData)
-{
-	// Read response from real-time capable application.
-	char rxBuf[32];
-	int bytesReceived = recv(sockFd, rxBuf, sizeof(rxBuf), 0);
-
-	if (bytesReceived == -1) {
-		Log_Debug("ERROR: Unable to receive message: %d (%s)\n", errno, strerror(errno));
-		terminationRequired = true;
-	}
-
-	Log_Debug("Received %d bytes: ", bytesReceived);
-	for (int i = 0; i < bytesReceived; ++i) {
-		Log_Debug("%c", isprint(rxBuf[i]) ? rxBuf[i] : '.');
-	}
-	Log_Debug("\n");
-}
-
-/// <summary>
-///     Handle send timer event by writing data to the real-time capable application.
-/// </summary>
-static void TimerEventHandler(EventData* eventData)
-{
-	if (ConsumeTimerFdEvent(rtCoreSend.fd) != 0) {
-		terminationRequired = true;
-		return;
-	}
-
-	SendMessageToRTCore();
-}
-
-/// <summary>
-///     Helper function for TimerEventHandler sends message to real-time capable application.
-/// </summary>
-static void SendMessageToRTCore(void)
-{
-	static int iter = 0;
-
-	// Send "HELLO-WORLD-%d" message to real-time capable application.
-	static char txMessage[32];
-	sprintf(txMessage, "Hello-World-%d", iter++);
-	Log_Debug("Sending: %s\n", txMessage);
-
-	int bytesSent = send(sockFd, txMessage, strlen(txMessage), 0);
-	if (bytesSent == -1) {
-		Log_Debug("ERROR: Unable to send message: %d (%s)\n", errno, strerror(errno));
-		terminationRequired = true;
-		return;
-	}
+END:
+	while (1);
 }

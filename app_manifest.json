@@ -1,15 +1,14 @@
 ﻿{
   "SchemaVersion": 1,
-  "Name": "AzureSphereIoTCentral",
-  "ComponentId": "25025d2c-66da-4448-bae1-ac26fcdd3627",
+  "Name": "Camera-Rework",
+  "ComponentId": "b21bc746-3c44-4469-8468-1135fd7f31d9",
   "EntryPoint": "/bin/app",
-  "CmdArgs": [ "0ne0002EE6D" ],
+  "CmdArgs": [],
   "Capabilities": {
-    "Gpio": [ 0, 9, 15 ],
-    "Uart": [ "ISU0" ],
-    "AllowedConnections": [ "global.azure-devices-provisioning.net", "saas-iothub-8135cd3b-f33a-4002-a44a-7ca5961b00b6.azure-devices.net" ],
-    "DeviceAuthentication": "9d7e79eb-e021-43ce-9f2b-fa944b447494",
-    "AllowedApplicationConnections": [ "005180BC-402F-4CB3-A662-72937DBCDE47" ]
+    "AllowedConnections": [ "owenstorageaccount.blob.core.windows.net" ],
+    "Gpio": [ 3 ],
+    "I2cMaster": [ "ISU0" ],
+    "SpiMaster": [ "ISU1" ]
   },
-  "ApplicationType": "Default"
+  "ApplicationType": "RealTimeCapable"
 }
