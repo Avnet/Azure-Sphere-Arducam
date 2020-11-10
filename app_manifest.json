@@ -5,7 +5,7 @@
   "EntryPoint": "/bin/app",
   "CmdArgs": [],
   "Capabilities": {
-    "AllowedConnections": [ "owenstorageaccount.blob.core.windows.net" ],
+    "AllowedConnections": [ "<storage-account>.blob.core.windows.net" ],
     "Gpio": [ 3 ],
     "I2cMaster": [ "ISU0" ],
     "SpiMaster": [ "ISU1" ]

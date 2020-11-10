@@ -29,7 +29,7 @@ struct image_buffer {
 };
 
 const char* FileURI = "https://owenstorageaccount.blob.core.windows.net/img/test.jpg";
-const char* SASToken = "?sv=2019-10-10&st=2020-11-03T11%3A56%3A11Z&se=2021-11-04T11%3A56%3A00Z&sr=c&sp=rcwl&sig=%2BTrpLpN3c7WY2v12Le3rRQSZ7EPsfUPYTy3RPUsxCTs%3D";
+const char* SASToken = "<SAS-Token>";
 
 static void LogCurlError(const char* message, int curlErrCode)
 {
